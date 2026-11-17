@@ -1,0 +1,183 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  
+  # 1. CI: code compile and passing of the test
+ 
+  test:
+    name: Typecheck, build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm 
+
+      - run: npm ci 
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm run test:unit 
+
+      
+      - name: Start the Postgres and Kafka containers
+        run: npm run test:db:up 
+
+     
+      - run: npm run test:coverage
+
+      - name: Show the container logs if something failed
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Stop the containers
+        if: always()
+        run: npm run test:db:down
+
+      - name: Save the coverage report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+  # 2. CI:  SQL migrations and seed data work 
+
+  migrations:
+    name: Check migrations on PostgreSQL
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: shop_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d shop_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: shop_ci
+      JWT_SECRET: ci-only-secret 
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run migrate
+      - run: npm run seed
+      - name: Check that the data is there
+        run: |
+          node -e "
+          const { Pool } = require('pg');
+          const pool = new Pool({
+            host: process.env.DB_HOST,
+            port: Number(process.env.DB_PORT),
+            user: process.env.DB_USER,
+            password: process.env.DB_PASSWORD,
+            database: process.env.DB_NAME,
+          });
+          (async () => {
+            for (const t of ['users', 'products', 'orders', 'order_items', 'notifications']) {
+              const r = await pool.query('SELECT COUNT(*) FROM ' + t);
+              console.log(t.padEnd(14), r.rows[0].count);
+            }
+            const users = await pool.query('SELECT COUNT(*) FROM users');
+            const products = await pool.query('SELECT COUNT(*) FROM products');
+            if (+users.rows[0].count === 0 || +products.rows[0].count === 0) {
+              throw new Error('seed data is missing');
+            }
+            await pool.end();
+          })().catch((e) => { console.error(e.message); process.exit(1); });
+          "
+
+  # 3. Build the Docker image.
+
+  docker:
+    name: Build Docker image
+    needs: [test, migrations] 
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write 
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build (and push on main)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # 4. CD: tell your hosting service to deploy the new image.
+  
+  deploy:
+    name: Deploy
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production # lets you add a manual approval in GitHub settings
+    steps:
+      - name: Trigger the deploy hook
+        env:
+          DEPLOY_HOOK_URL: ${{ secrets.DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$DEPLOY_HOOK_URL" ]; then
+            echo "DEPLOY_HOOK_URL is not set, so nothing was deployed."
+            echo "The image was already published to ghcr.io."
+            exit 0
+          fi
+          curl --fail --silent --show-error -X POST "$DEPLOY_HOOK_URL"
+          echo "Deploy triggered."
